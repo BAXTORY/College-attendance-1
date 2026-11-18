@@ -2,272 +2,521 @@ import os
 import sqlite3
 from functools import wraps
 from datetime import date
-from flask import Flask, request, redirect, url_for, session, flash, render_template_string, send_file
-from werkzeug.security import generate_password_hash, check_password_hash
-from io import BytesIO
+from flask import (
+    Flask, request, redirect, url_for,
+    session, flash, render_template_string,
+    send_file
+)
+from werkzeug.security import (
+    generate_password_hash,
+    check_password_hash
+)
 
 app = Flask(__name__)
-app.secret_key = os.environ.get("FLASK_SECRET_KEY", "change-this-secret-key-before-launch")
-DB_PATH = os.environ.get("ATTENDANCE_DB", os.path.join(os.path.dirname(__file__), "attendance.db"))
+app.secret_key = os.environ.get("SECRET_KEY", "change-this-secret")
 
-# Change these before using the site publicly.
-ADMIN_USERNAME = os.environ.get("ADMIN_USERNAME", "admin")
-ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "ChangeMe-2026!")
+DB = os.environ.get("DATABASE_PATH", "attendance.db")
 
-BASE_STYLE = """
-:root{--navy:#142b4a;--blue:#2563eb;--pale:#eff6ff;--ink:#172033;--muted:#64748b;--line:#e5eaf2;--bg:#f5f7fb}
-*{box-sizing:border-box}body{margin:0;background:var(--bg);font-family:Inter,system-ui,-apple-system,Segoe UI,Roboto,Arial;color:var(--ink)}
-a{text-decoration:none;color:inherit}.layout{display:flex;min-height:100vh}.side{width:245px;background:var(--navy);color:white;padding:26px 18px;flex-shrink:0}
-.brand{font-size:20px;font-weight:800;padding:8px 10px 28px}.brand small{display:block;color:#b9c9df;font-size:12px;font-weight:500;margin-top:5px}
-.nav a{display:block;padding:12px 14px;border-radius:10px;color:#d7e3f2;margin:5px 0}.nav a.active,.nav a:hover{background:#24466f;color:white}
-.main{flex:1;min-width:0;padding:30px}.top{display:flex;justify-content:space-between;align-items:center;gap:15px;margin-bottom:24px}
-h1{font-size:27px;margin:0 0 5px}.sub{color:var(--muted);font-size:14px}.user{color:var(--muted);font-size:13px}
-.cards{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:16px;margin:20px 0}
-.card,.panel{background:white;border:1px solid var(--line);border-radius:16px;padding:20px;box-shadow:0 5px 20px #1d35570a}
-.kicker{font-size:13px;color:var(--muted)}.number{font-size:30px;font-weight:800;margin-top:8px}
-.panel{margin-top:18px}.panelhead{display:flex;justify-content:space-between;align-items:center;gap:12px;margin-bottom:14px}
-h2{font-size:18px;margin:0}input,select{width:100%;padding:11px 12px;border:1px solid #d8e0eb;border-radius:9px;background:white;font:inherit;min-width:0}
-label{display:block;font-size:13px;color:#475569;margin:0 0 6px}.field{margin-bottom:13px}
-button,.btn{border:0;border-radius:9px;padding:11px 15px;background:var(--blue);color:white;font:600 14px inherit;cursor:pointer;display:inline-block}
-.btn.secondary,button.secondary{background:#eaf1fb;color:#1e3a5f}.btn.danger,button.danger{background:#fee2e2;color:#991b1b}
-.actions{display:flex;gap:8px;flex-wrap:wrap}.gridform{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;align-items:end}
-table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:12px 10px;border-bottom:1px solid var(--line);font-size:14px}th{font-size:12px;color:var(--muted);text-transform:uppercase;letter-spacing:.04em}
-.pill{display:inline-block;padding:5px 9px;border-radius:20px;font-size:12px;background:#dcfce7;color:#166534}.pill.absent{background:#fee2e2;color:#991b1b}
-.notice{padding:11px 14px;border-radius:10px;background:#eff6ff;color:#1e40af;margin:12px 0}.error{background:#fff1f2;color:#9f1239}
-.loginwrap{min-height:100vh;display:grid;place-items:center;padding:20px}.login{width:min(420px,100%);background:white;border:1px solid var(--line);border-radius:18px;padding:30px;box-shadow:0 15px 45px #17203314}
-@media(max-width:800px){.layout{display:block}.side{width:auto;padding:15px}.brand{padding:5px 8px 12px}.nav{display:flex;overflow:auto;gap:5px}.nav a{white-space:nowrap}.main{padding:18px}.cards{grid-template-columns:1fr 1fr}.gridform{grid-template-columns:1fr}.top{align-items:flex-start;flex-direction:column}}
-@media(max-width:480px){.cards{grid-template-columns:1fr}table{min-width:650px}.tablewrap{overflow:auto}}
-"""
 
-SHELL = """<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{{ title }} · College Attendance</title><style>""" + BASE_STYLE + """</style></head><body><div class="layout"><aside class="side"><div class="brand">CampusTrack<small>Attendance management</small></div><nav class="nav">
-<a class="{{ 'active' if active=='dashboard' else '' }}" href="{{ url_for('dashboard') }}">Dashboard</a>
-<a class="{{ 'active' if active=='students' else '' }}" href="{{ url_for('students') }}">Students</a>
-<a class="{{ 'active' if active=='attendance' else '' }}" href="{{ url_for('attendance') }}">Mark attendance</a>
-<a class="{{ 'active' if active=='reports' else '' }}" href="{{ url_for('reports') }}">Reports & exports</a>
-<a href="{{ url_for('logout') }}">Log out</a></nav></aside><main class="main"><div class="top"><div><h1>{{ title }}</h1><div class="sub">College attendance dashboard</div></div><div class="user">Signed in as <b>{{ session.get('admin_name') }}</b></div></div>
-{% with messages=get_flashed_messages() %}{% if messages %}{% for m in messages %}<div class="notice">{{m}}</div>{% endfor %}{% endif %}{% endwith %}
-{{ content|safe }}</main></div></body></html>"""
-
-def connect():
-    con = sqlite3.connect(DB_PATH)
+def db():
+    con = sqlite3.connect(DB)
     con.row_factory = sqlite3.Row
     return con
 
-def columns(con, table):
-    return [r["name"] for r in con.execute(f"PRAGMA table_info({table})").fetchall()]
 
-def pick(existing, choices):
-    return next((x for x in choices if x in existing), None)
+def setup():
+    con = db()
 
-def init_db():
-    con = connect()
-    con.execute("""CREATE TABLE IF NOT EXISTS students (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        roll TEXT, registration_no TEXT, name TEXT NOT NULL
-    )""")
-    con.execute("""CREATE TABLE IF NOT EXISTS attendance (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        student_id INTEGER NOT NULL, date TEXT NOT NULL, status TEXT NOT NULL,
-        FOREIGN KEY(student_id) REFERENCES students(id)
-    )""")
-    # Add newer fields without deleting or replacing existing records.
-    sc = columns(con, "students")
-    for col, typ in [("roll", "TEXT"), ("registration_no", "TEXT"), ("name", "TEXT")]:
-        if col not in sc:
-            con.execute(f"ALTER TABLE students ADD COLUMN {col} {typ}")
-    ac = columns(con, "attendance")
-    if "date" not in ac and "day" in ac:
-        con.execute("ALTER TABLE attendance RENAME COLUMN day TO date")
-        ac = columns(con, "attendance")
-    if "date" not in ac:
-        con.execute("ALTER TABLE attendance ADD COLUMN date TEXT")
-    if "status" not in ac:
-        con.execute("ALTER TABLE attendance ADD COLUMN status TEXT")
-    if "student_id" not in ac:
-        con.execute("ALTER TABLE attendance ADD COLUMN student_id INTEGER")
-    con.execute("CREATE INDEX IF NOT EXISTS idx_attendance_date ON attendance(date)")
-    # Create/update the single configured admin account.
-    con.execute("""CREATE TABLE IF NOT EXISTS admins (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT UNIQUE NOT NULL,
-        password_hash TEXT NOT NULL
-    )""")
-    row = con.execute("SELECT id FROM admins WHERE username=?", (ADMIN_USERNAME,)).fetchone()
-    if row:
-        con.execute("UPDATE admins SET password_hash=? WHERE username=?",
-                    (generate_password_hash(ADMIN_PASSWORD), ADMIN_USERNAME))
-    else:
-        con.execute("INSERT INTO admins(username,password_hash) VALUES(?,?)",
-                    (ADMIN_USERNAME, generate_password_hash(ADMIN_PASSWORD)))
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT UNIQUE NOT NULL,
+            password TEXT NOT NULL,
+            role TEXT NOT NULL,
+            student_id INTEGER
+        )
+    """)
+
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS students (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            roll TEXT,
+            registration_no TEXT,
+            name TEXT NOT NULL
+        )
+    """)
+
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS attendance (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            student_id INTEGER NOT NULL,
+            date TEXT NOT NULL,
+            status TEXT NOT NULL,
+            UNIQUE(student_id, date)
+        )
+    """)
+
     con.commit()
     con.close()
 
-def schema():
-    con = connect()
-    sc, ac = columns(con, "students"), columns(con, "attendance")
-    result = {
-        "sid": pick(sc, ["id", "student_id"]),
-        "roll": pick(sc, ["roll", "roll_no", "roll_number"]),
-        "reg": pick(sc, ["registration_no", "registration", "reg_no", "registration_number"]),
-        "name": pick(sc, ["name", "student_name"]),
-        "aid": pick(ac, ["id"]),
-        "student_id": pick(ac, ["student_id"]),
-        "date": pick(ac, ["date", "day"]),
-        "status": pick(ac, ["status"])
-    }
-    con.close()
-    if not all(result[k] for k in ["sid", "name", "student_id", "date", "status"]):
-        raise RuntimeError("The existing database has an unexpected schema. Keep a backup and ask for a schema-specific app.py.")
-    return result
+
+setup()
+
 
 def login_required(fn):
     @wraps(fn)
     def wrapper(*args, **kwargs):
-        if not session.get("admin_id"):
-            return redirect(url_for("login", next=request.path))
+        if "user_id" not in session:
+            return redirect(url_for("login"))
         return fn(*args, **kwargs)
     return wrapper
 
+
+def role_required(*roles):
+    def decorator(fn):
+        @wraps(fn)
+        @login_required
+        def wrapper(*args, **kwargs):
+            if session.get("role") not in roles:
+                return "Access denied", 403
+            return fn(*args, **kwargs)
+        return wrapper
+    return decorator
+
+
+PAGE = """
+<!DOCTYPE html>
+<html>
+<head>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CampusTrack</title>
+<style>
+body {
+    font-family: Arial, sans-serif;
+    background: #f1f5f9;
+    margin: 0;
+    color: #172554;
+}
+header {
+    background: #142b4a;
+    color: white;
+    padding: 20px;
+}
+main {
+    max-width: 850px;
+    margin: 25px auto;
+    padding: 20px;
+}
+.card {
+    background: white;
+    padding: 22px;
+    border-radius: 14px;
+    margin-bottom: 18px;
+    box-shadow: 0 3px 15px #0001;
+}
+input, select, button {
+    padding: 12px;
+    margin: 7px 0;
+    width: 100%;
+    box-sizing: border-box;
+}
+button {
+    background: #2563eb;
+    color: white;
+    border: 0;
+    border-radius: 7px;
+}
+a { color: #2563eb; }
+table {
+    width: 100%;
+    border-collapse: collapse;
+}
+td, th {
+    padding: 10px;
+    border-bottom: 1px solid #ddd;
+    text-align: left;
+}
+</style>
+</head>
+<body>
+<header>
+<h2>CampusTrack</h2>
+College Attendance Management
+</header>
+<main>
+{{ content|safe }}
+</main>
+</body>
+</html>
+"""
 @app.route("/login", methods=["GET", "POST"])
 def login():
     if request.method == "POST":
-        username = request.form.get("username", "").strip()
-        password = request.form.get("password", "")
-        con = connect()
-        admin = con.execute("SELECT * FROM admins WHERE username=?", (username,)).fetchone()
+        username = request.form["username"].strip()
+        password = request.form["password"]
+
+        con = db()
+        user = con.execute(
+            "SELECT * FROM users WHERE username=?",
+            (username,)
+        ).fetchone()
         con.close()
-        if admin and check_password_hash(admin["password_hash"], password):
+
+        if user and check_password_hash(user["password"], password):
             session.clear()
-            session["admin_id"] = admin["id"]
-            session["admin_name"] = admin["username"]
-            return redirect(request.args.get("next") or url_for("dashboard"))
-        flash("Incorrect admin ID or password.")
-    return render_template_string("""<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><title>Admin login</title><style>""" + BASE_STYLE + """</style></head><body><div class="loginwrap"><form class="login" method="post"><div class="brand" style="color:#142b4a;padding:0 0 20px">CampusTrack<small style="color:#64748b">Admin access only</small></div><h1 style="font-size:24px">Welcome back</h1><p class="sub">Sign in to manage college attendance.</p>{% with messages=get_flashed_messages() %}{% for m in messages %}<div class="notice error">{{m}}</div>{% endfor %}{% endwith %}<div class="field"><label>Admin ID</label><input name="username" required autocomplete="username"></div><div class="field"><label>Password</label><input type="password" name="password" required autocomplete="current-password"></div><button style="width:100%">Sign in</button></form></div></body></html>""")
+            session["user_id"] = user["id"]
+            session["username"] = user["username"]
+            session["role"] = user["role"]
+            session["student_id"] = user["student_id"]
+            return redirect(url_for("dashboard"))
+
+        flash("Invalid username or password")
+
+    return render_template_string(PAGE, content="""
+        <div class="card">
+        <h2>Login</h2>
+        {% with messages = get_flashed_messages() %}
+          {% for message in messages %}
+            <p>{{ message }}</p>
+          {% endfor %}
+        {% endwith %}
+        <form method="post">
+            <input name="username" placeholder="User ID" required>
+            <input name="password" type="password"
+                   placeholder="Password" required>
+            <button type="submit">Login</button>
+        </form>
+        </div>
+    """)
+
+
+@app.route("/")
+@login_required
+def dashboard():
+    role = session["role"]
+
+    content = f"""
+    <div class="card">
+    <h2>Welcome, {session['username']}</h2>
+    <p>Role: {role.title()}</p>
+    """
+
+    if role == "admin":
+        content += """
+        <p><a href="/create-user">Create teacher/student account</a></p>
+        <p><a href="/students">Manage students</a></p>
+        <p><a href="/reports">Attendance reports</a></p>
+        """
+
+    elif role == "teacher":
+        content += """
+        <p><a href="/attendance">Mark attendance</a></p>
+        <p><a href="/students">View students</a></p>
+        <p><a href="/reports">Attendance reports</a></p>
+        """
+
+    elif role == "student":
+        content += """
+        <p><a href="/my-attendance">My attendance</a></p>
+        """
+
+    content += '<p><a href="/logout">Log out</a></p></div>'
+
+    return render_template_string(PAGE, content=content)
+
 
 @app.route("/logout")
 def logout():
     session.clear()
     return redirect(url_for("login"))
+    @app.route("/setup-admin", methods=["GET", "POST"])
+def setup_admin():
+    con = db()
+    count = con.execute(
+        "SELECT COUNT(*) FROM users"
+    ).fetchone()[0]
 
-@app.route("/")
-@login_required
-def dashboard():
-    s = schema()
-    con = connect()
-    total = con.execute(f"SELECT COUNT(*) n FROM students").fetchone()["n"]
-    today = date.today().isoformat()
-    present = con.execute(f"SELECT COUNT(*) n FROM attendance WHERE {s['date']}=? AND lower({s['status']})='present'", (today,)).fetchone()["n"]
-    absent = con.execute(f"SELECT COUNT(*) n FROM attendance WHERE {s['date']}=? AND lower({s['status']})='absent'", (today,)).fetchone()["n"]
-    recent = con.execute(f"""SELECT st.{s['name']} name, a.{s['status']} status
-        FROM attendance a JOIN students st ON st.{s['sid']}=a.{s['student_id']}
-        WHERE a.{s['date']}=? ORDER BY a.rowid DESC LIMIT 8""", (today,)).fetchall()
-    con.close()
-    content = render_template_string("""<div class="cards"><div class="card"><div class="kicker">Total students</div><div class="number">{{total}}</div></div><div class="card"><div class="kicker">Present today</div><div class="number">{{present}}</div></div><div class="card"><div class="kicker">Absent today</div><div class="number">{{absent}}</div></div></div><section class="panel"><div class="panelhead"><h2>Today's attendance · {{today}}</h2><a class="btn secondary" href="{{url_for('attendance')}}">Take attendance</a></div>{% if recent %}<div class="tablewrap"><table><tr><th>Student</th><th>Status</th></tr>{% for r in recent %}<tr><td>{{r.name}}</td><td><span class="pill {{'absent' if r.status|lower=='absent' else ''}}">{{r.status}}</span></td></tr>{% endfor %}</table></div>{% else %}<p class="sub">No attendance has been recorded today.</p>{% endif %}</section>""", total=total, present=present, absent=absent, today=today, recent=recent)
-    return render_template_string(SHELL, title="Dashboard", active="dashboard", content=content)
+    if count > 0:
+        con.close()
+        return "Admin setup is already completed."
 
-@app.route("/students", methods=["GET", "POST"])
-@login_required
-def students():
-    s = schema()
-    con = connect()
     if request.method == "POST":
-        roll, reg, name = request.form.get("roll", "").strip(), request.form.get("registration_no", "").strip(), request.form.get("name", "").strip()
-        if not name:
-            flash("Student name is required.")
-        else:
-            fields, values = [], []
-            for key, val in [(s["roll"], roll), (s["reg"], reg), (s["name"], name)]:
-                if key:
-                    fields.append(key); values.append(val)
-            con.execute(f"INSERT INTO students ({','.join(fields)}) VALUES ({','.join('?' for _ in values)})", values)
-            con.commit()
-            flash("Student added.")
+        username = request.form["username"].strip()
+        password = request.form["password"]
+
+        if not username or len(password) < 8:
             con.close()
-            return redirect(url_for("students"))
-    rows = con.execute(f"SELECT * FROM students ORDER BY {s['roll'] or s['sid']}").fetchall()
-    con.close()
-    content = render_template_string("""<section class="panel"><h2>Add a student</h2><form method="post" class="gridform" style="margin-top:16px"><div class="field"><label>Roll number</label><input name="roll"></div><div class="field"><label>Registration number</label><input name="registration_no"></div><div class="field"><label>Full name *</label><input name="name" required></div><button>Add student</button></form></section><section class="panel"><div class="panelhead"><h2>Student directory</h2><span class="sub">{{rows|length}} students</span></div><div class="tablewrap"><table><tr><th>Roll</th><th>Registration no.</th><th>Name</th></tr>{% for r in rows %}<tr><td>{{r[roll] if roll else '—'}}</td><td>{{r[reg] if reg else '—'}}</td><td>{{r[name]}}</td></tr>{% endfor %}</table></div></section>""", rows=rows, roll=s["roll"], reg=s["reg"], name=s["name"])
-    return render_template_string(SHELL, title="Students", active="students", content=content)
+            return "Username is required and password must be at least 8 characters."
 
-@app.route("/attendance", methods=["GET", "POST"])
-@login_required
-def attendance():
-    s = schema()
-    con = connect()
-    day = request.values.get("date", date.today().isoformat())
-    if request.method == "POST":
-        for student in con.execute("SELECT * FROM students").fetchall():
-            value = request.form.get("status_" + str(student[s["sid"]]), "Absent")
-            value = "Present" if value == "Present" else "Absent"
-            old = con.execute(f"SELECT {s['aid'] or 'rowid'} FROM attendance WHERE {s['student_id']}=? AND {s['date']}=?",
-                              (student[s["sid"]], day)).fetchone()
-            if old:
-                con.execute(f"UPDATE attendance SET {s['status']}=? WHERE {s['student_id']}=? AND {s['date']}=?",
-                            (value, student[s["sid"]], day))
-            else:
-                con.execute(f"INSERT INTO attendance ({s['student_id']},{s['date']},{s['status']}) VALUES (?,?,?)",
-                            (student[s["sid"]], day, value))
+        con.execute(
+            "INSERT INTO users (username, password, role) VALUES (?, ?, ?)",
+            (username, generate_password_hash(password), "admin")
+        )
         con.commit()
-        flash("Attendance saved.")
-    students_rows = con.execute(f"""SELECT st.*,
-        (SELECT a.{s['status']} FROM attendance a WHERE a.{s['student_id']}=st.{s['sid']}
-         AND a.{s['date']}=? ORDER BY a.rowid DESC LIMIT 1) AS today_status
-        FROM students st ORDER BY st.{s['roll'] or s['sid']}""", (day,)).fetchall()
+        con.close()
+        return redirect(url_for("login"))
+
     con.close()
-    content = render_template_string("""<section class="panel"><form method="get" class="gridform"><div class="field"><label>Attendance date</label><input type="date" name="date" value="{{day}}"></div><div></div><button>Load date</button></form></section><section class="panel"><div class="panelhead"><h2>Mark students</h2><span class="sub">{{students|length}} students</span></div>{% if students %}<form method="post"><input type="hidden" name="date" value="{{day}}"><div class="tablewrap"><table><tr><th>Roll</th><th>Registration no.</th><th>Name</th><th>Status</th></tr>{% for st in students %}<tr><td>{{st[roll] if roll else '—'}}</td><td>{{st[reg] if reg else '—'}}</td><td>{{st[name]}}</td><td><select name="status_{{st[sid]}}"><option value="Present" {{'selected' if st.today_status=='Present' else ''}}>Present</option><option value="Absent" {{'selected' if st.today_status!='Present' else ''}}>Absent</option></select></td></tr>{% endfor %}</table></div><p><button>Save attendance</button></p></form>{% else %}<p class="sub">Add students first.</p>{% endif %}</section>""", day=day, students=students_rows, roll=s["roll"], reg=s["reg"], name=s["name"], sid=s["sid"])
-    return render_template_string(SHELL, title="Mark attendance", active="attendance", content=content)
 
-@app.route("/reports")
-@login_required
-def reports():
-    content = """<section class="panel"><h2>Download attendance records</h2><p class="sub">Export the saved student and attendance records.</p><div class="actions"><a class="btn" href="/export/excel">Download Excel (.xlsx)</a><a class="btn secondary" href="/export/pdf">Download PDF</a></div></section>"""
-    return render_template_string(SHELL, title="Reports & exports", active="reports", content=content)
+    return render_template_string(PAGE, content="""
+    <div class="card">
+        <h2>Create First Admin</h2>
+        <form method="post">
+            <input name="username" placeholder="Admin ID" required>
+            <input name="password" type="password"
+                   placeholder="Password (minimum 8 characters)" required>
+            <button type="submit">Create Admin</button>
+        </form>
+    </div>
+    """)
 
-@app.route("/export/excel")
-@login_required
-def export_excel():
-    try:
-        from openpyxl import Workbook
-    except ImportError:
-        return "Install openpyxl: pip install openpyxl", 500
-    s = schema(); con = connect()
-    rows = con.execute(f"""SELECT st.{s['roll'] or s['sid']}, {('st.'+s['reg']) if s['reg'] else "''"}, st.{s['name']},
-        a.{s['date']}, a.{s['status']} FROM students st LEFT JOIN attendance a
-        ON st.{s['sid']}=a.{s['student_id']} ORDER BY st.{s['roll'] or s['sid']}, a.{s['date']}""").fetchall()
+
+@app.route("/create-user", methods=["GET", "POST"])
+@role_required("admin")
+def create_user():
+    con = db()
+    students = con.execute(
+        "SELECT * FROM students ORDER BY roll"
+    ).fetchall()
+
+    if request.method == "POST":
+        username = request.form["username"].strip()
+        password = request.form["password"]
+        role = request.form["role"]
+        student_id = request.form.get("student_id") or None
+
+        if role not in ("teacher", "student"):
+            con.close()
+            return "Invalid role", 400
+
+        if not username or len(password) < 8:
+            con.close()
+            return "Username required; password must be at least 8 characters."
+
+        if role == "student" and not student_id:
+            con.close()
+            return "Select a student record first."
+
+        try:
+            con.execute("""
+                INSERT INTO users (username, password, role, student_id)
+                VALUES (?, ?, ?, ?)
+            """, (
+                username,
+                generate_password_hash(password),
+                role,
+                student_id if role == "student" else None
+            ))
+            con.commit()
+            flash("Account created successfully.")
+        except sqlite3.IntegrityError:
+            flash("That username already exists.")
+
+        con.close()
+        return redirect(url_for("create_user"))
+
     con.close()
-    wb = Workbook(); ws = wb.active; ws.title = "Attendance"
-    ws.append(["Roll", "Registration No.", "Name", "Date", "Status"])
-    for r in rows: ws.append(list(r))
-    for col in ws.columns:
-        ws.column_dimensions[col[0].column_letter].width = min(max(max(len(str(c.value or "")) for c in col)+2, 12), 32)
-    out = BytesIO(); wb.save(out); out.seek(0)
-    return send_file(out, as_attachment=True, download_name="attendance.xlsx", mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
-@app.route("/export/pdf")
-@login_required
-def export_pdf():
-    try:
-        from reportlab.lib import colors
-        from reportlab.lib.pagesizes import A4, landscape
-        from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
-        from reportlab.lib.styles import getSampleStyleSheet
-    except ImportError:
-        return "Install reportlab: pip install reportlab", 500
-    s = schema(); con = connect()
-    rows = con.execute(f"""SELECT st.{s['roll'] or s['sid']}, {('st.'+s['reg']) if s['reg'] else "''"}, st.{s['name']},
-        a.{s['date']}, a.{s['status']} FROM students st LEFT JOIN attendance a
-        ON st.{s['sid']}=a.{s['student_id']} ORDER BY st.{s['roll'] or s['sid']}, a.{s['date']}""").fetchall()
+    return render_template_string(PAGE, content="""
+    <div class="card">
+        <h2>Create Account</h2>
+        {% with messages = get_flashed_messages() %}
+          {% for message in messages %}<p>{{ message }}</p>{% endfor %}
+        {% endwith %}
+        <form method="post">
+            <input name="username" placeholder="New User ID" required>
+            <input name="password" type="password"
+                   placeholder="Password (minimum 8 characters)" required>
+
+            <select name="role" required>
+                <option value="teacher">Teacher</option>
+                <option value="student">Student</option>
+            </select>
+
+            <label>Student record (required for student accounts)</label>
+            <select name="student_id">
+                <option value="">Select student</option>
+                {% for s in students %}
+                <option value="{{ s.id }}">
+                    {{ s.roll }} - {{ s.name }}
+                </option>
+                {% endfor %}
+            </select>
+
+            <button type="submit">Create Account</button>
+        </form>
+        <p><a href="/">Back to Dashboard</a></p>
+    </div>
+    """, students=students)
+    @app.route("/students", methods=["GET", "POST"])
+@role_required("admin", "teacher")
+def students_page():
+    con = db()
+
+    if request.method == "POST":
+        if session["role"] != "admin":
+            con.close()
+            return "Access denied", 403
+
+        roll = request.form["roll"].strip()
+        registration_no = request.form["registration_no"].strip()
+        name = request.form["name"].strip()
+
+        if name:
+            con.execute("""
+                INSERT INTO students (roll, registration_no, name)
+                VALUES (?, ?, ?)
+            """, (roll, registration_no, name))
+            con.commit()
+
+        con.close()
+        return redirect(url_for("students_page"))
+
+    students = con.execute(
+        "SELECT * FROM students ORDER BY roll"
+    ).fetchall()
+
     con.close()
-    out = BytesIO(); doc = SimpleDocTemplate(out, pagesize=landscape(A4))
-    data = [["Roll", "Registration No.", "Name", "Date", "Status"]] + [list(map(lambda x: str(x or ""), r)) for r in rows]
-    table = Table(data, repeatRows=1)
-    table.setStyle(TableStyle([("BACKGROUND",(0,0),(-1,0),colors.HexColor("#142b4a")),("TEXTCOLOR",(0,0),(-1,0),colors.white),("GRID",(0,0),(-1,-1),.4,colors.HexColor("#d8e0eb")),("ROWBACKGROUNDS",(0,1),(-1,-1),[colors.white,colors.HexColor("#f2f6fc")]),("PADDING",(0,0),(-1,-1),7)]))
-    styles = getSampleStyleSheet()
-    doc.build([Paragraph("College Attendance Report", styles["Title"]), Spacer(1,14), table])
-    out.seek(0)
-    return send_file(out, as_attachment=True, download_name="attendance.pdf", mimetype="application/pdf")
 
-with app.app_context():
-    init_db()
+    return render_template_string(PAGE, content="""
+    <div class="card">
+        <h2>Student Records</h2>
 
-if __name__ == "__main__":
-    app.run(debug=False)
+        {% if role == "admin" %}
+        <form method="post">
+            <input name="roll" placeholder="Roll Number" required>
+            <input name="registration_no"
+                   placeholder="Registration Number">
+            <input name="name" placeholder="Student Name" required>
+            <button type="submit">Add Student</button>
+        </form>
+        {% endif %}
+
+        <h3>Student List</h3>
+        <table>
+            <tr>
+                <th>Roll</th>
+                <th>Registration</th>
+                <th>Name</th>
+            </tr>
+            {% for s in students %}
+            <tr>
+                <td>{{ s.roll }}</td>
+                <td>{{ s.registration_no }}</td>
+                <td>{{ s.name }}</td>
+            </tr>
+            {% endfor %}
+        </table>
+
+        <p><a href="/">Back to Dashboard</a></p>
+    </div>
+    """, students=students, role=session["role"])
+    @app.route("/attendance", methods=["GET", "POST"])
+@role_required("teacher")
+def attendance_page():
+    con = db()
+
+    if request.method == "POST":
+        attendance_date = request.form["date"]
+
+        for key, value in request.form.items():
+            if key.startswith("status_"):
+                student_id = key.replace("status_", "")
+
+                if value not in ("Present", "Absent"):
+                    continue
+
+                con.execute("""
+                    INSERT INTO attendance (student_id, date, status)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(student_id, date)
+                    DO UPDATE SET status=excluded.status
+                """, (student_id, attendance_date, value))
+
+        con.commit()
+        con.close()
+        flash("Attendance saved successfully.")
+        return redirect(url_for("attendance_page"))
+
+    students = con.execute(
+        "SELECT * FROM students ORDER BY roll"
+    ).fetchall()
+
+    con.close()
+
+    return render_template_string(PAGE, content="""
+    <div class="card">
+        <h2>Mark Attendance</h2>
+
+        {% with messages = get_flashed_messages() %}
+          {% for message in messages %}<p>{{ message }}</p>{% endfor %}
+        {% endwith %}
+
+        <form method="post">
+            <label>Attendance Date</label>
+            <input type="date" name="date" value="{{ today }}" required>
+
+            <table>
+                <tr>
+                    <th>Roll</th>
+                    <th>Name</th>
+                    <th>Status</th>
+                </tr>
+
+                {% for s in students %}
+                <tr>
+                    <td>{{ s.roll }}</td>
+                    <td>{{ s.name }}</td>
+                    <td>
+                        <select name="status_{{ s.id }}">
+                            <option value="Present">Present</option>
+                            <option value="Absent">Absent</option>
+                        </select>
+                    </td>
+                </tr>
+                {% endfor %}
+            </table>
+
+            <button type="submit">Save Attendance</button>
+        </form>
+
+        <p><a href="/">Back to Dashboard</a></p>
+    </div>
+    """, students=students, today=date.today().isoformat())
+
+
+@app.route("/my-attendance")
+@role_required("student")
+def my_attendance():
+    con = db()
+
+    records = con.execute("""
+        SELECT date, status
+        FROM attendance
+        WHERE student_id = ?
+        ORDER BY date DESC
+    """, (session["student_id"],)).fetchall()
+
+    con.close()
+
+    return render_template_string(PAGE, content="""
+    <div class="card">
+        <h2>My Attendance</h2>
+
+        <table>
+            <tr>
+                <th>Date</th>
+                <th>Status</th>
+            </tr>
+            {% for r in records %}
+            <tr>
+                <td>{{ r.date }}</td>
+                <td>{{ r.status }}</td>
+            </tr>
+            {% endfor %}
+        </table>
+
+        <p>Total classes: {{ records|length }}</p>
+        <p><a href="/">Back to Dashboard</a></p>
+    </div>
+    """, records=records)
